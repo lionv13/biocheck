@@ -1,0 +1,226 @@
+###packages
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait 
+from selenium.webdriver.support.ui import Select
+from selenium.webdriver.common.action_chains import ActionChains
+import time
+
+#-----------------------------------------------------
+data = pd.read_excel(r"/Users/gast/Documents/biocheck/trabajos/Agosto/task1/2UGhent.Biochek_ClassyFarm_Data_18.06.2024.xlsx", sheet_name= 'Biocheck')
+
+
+
+columns_to_remove = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+data = data.drop(data.columns[columns_to_remove], axis=1)
+
+# Remove columns 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+print(data)  # To display the modified dataframe
+
+
+##variables
+offset = 1 #excel rij - 2, laatste getal in site, reeks die je wil toevoegen - 1
+species = 'Pigs indoor'
+username = 'lionv13@hotmail.com'
+password = 'S@uzalito31.'
+
+#----------------------------------------------------
+
+# Open site
+# open google driver
+PATH = "C:\Program Files (x86)\chromedriver.exe"
+driver = webdriver.Chrome()
+
+def inloggen():
+    # officiele site
+    driver.get('https://biocheckgent.com/en/user/login?destination=/en/dashboard')
+
+    # test site
+    # driver.get('https://biocheck.release.entityone.be/en/user/login')
+    # time.sleep(5)
+
+    #input credentials
+    driver.find_element("id", "edit-name").send_keys(username, Keys.TAB, password, Keys.RETURN)
+
+inloggen()
+numberofrows = data.shape[0]
+print (numberofrows)
+def starting_number(number):
+    return number
+
+def starting_clicks(title):
+    try:
+        driver.find_element(By.LINK_TEXT, 'Surveys').click()
+        driver.find_element(By.LINK_TEXT, species).click()
+        WebDriverWait(driver, 4).until(EC.element_to_be_clickable((By.NAME, 'language')))
+        select_element = Select(driver.find_element(By.NAME, "language"))
+        select_element.select_by_index(7)
+        driver.find_element(By.XPATH, '//*[@id="edit-submit"]').click()
+        WebDriverWait(driver, 4).until(
+            EC.element_to_be_clickable((By.ID, 'edit-title-0-value'))
+        ).send_keys(title, Keys.TAB, Keys.TAB, Keys.RETURN, Keys.ARROW_DOWN * 114, Keys.RETURN)
+        dropdown = Select(driver.find_element(By.ID, 'edit-owner-address-0-address-country-code--2'))
+        dropdown.select_by_visible_text('Italia')
+        driver.find_element(By.ID, 'edit-field-permission-value').click()
+        driver.find_element(By.ID, 'edit-submit').click()
+        time.sleep(5)
+    except TimeoutException:
+        print("An element wasn't clickable in time.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+def answer_radio(id):
+    try:
+        WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.CSS_SELECTOR, f"[id^='{id}']"))).send_keys(Keys.SPACE)
+    except TimeoutException:
+        print(f"Failed to click radio button with id: {id}")
+    except Exception as e:
+        print(f"An error occurred while interacting with the radio button: {e}")
+
+def answer_num(id, number):
+    try:
+        WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.CSS_SELECTOR, f"[id^='{id}']"))).send_keys(str(number))
+    except TimeoutException:
+        print(f"Failed to enter number in input with id: {id}")
+    except Exception as e:
+        print(f"An error occurred while entering the number: {e}")
+
+def answer_text(id, text):
+    try:
+        WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.CSS_SELECTOR, f"[id^='{id}']"))).send_keys(text)
+    except TimeoutException:
+        print(f"Failed to enter text in input with id: {id}")
+    except Exception as e:
+        print(f"An error occurred while entering the text: {e}")
+
+def click_save_button(driver):
+    try:
+        save_button = driver.find_element(By.CSS_SELECTOR, '[data-drupal-selector="edit-submit"]')
+        driver.execute_script("arguments[0].scrollIntoView(true);", save_button)
+        ActionChains(driver).move_to_element(save_button).click(save_button).perform()
+        print("Botón 'Salvare il questionario' clickeado con éxito.")
+    except Exception as e:
+        print(f"Error al intentar hacer clic en el botón: {str(e)}")
+
+def determine_choice(j):
+    if j in [
+        'Si', 'Sempre', 'Sempre dalla stesso fornitore', 
+        'Si (allevatore, personale dipendente o ditta specializzata)', 
+        'Sì/No castrazione/Una lama per nidiata', '2 volte l’anno o meno', 
+        '3 o meno suini per m²', 'Sì, siempre più alto o uguale',"Due o meno all'anno",
+        'Una volta', 'Zona di carico separata', 
+        'Sì (allevatore, personale dipendente o ditta specializzata)', 
+        'Bassa densità', '1,5 o più m² per animale (suino leggero = 1 o più m² per animale)']:
+        return 1
+    elif j in [
+        'No', 'Qualche volta', 
+        'Da differenti fornitori', '4 suini per m²', "Tra 3 e 6 volte all'anno",
+        'Più di una volta', 'Tra le 3 e le 6 volte l’anno',
+        'Corridoio centrale o capannone', 'Non', 'Alta densità',
+        'Tra 1,1 e 1,4 m² per animale (suino leggero = Tra 0,7 e 0,9 m² per animale)']:
+        return 2
+    elif j in [
+        'Mai', 'Tra le 6 y 12 veces al año', '5 suini per m²', 'Tra le 6 e le 12 volte l’anno'
+        'Non so', "Tra 6 e 12 volte all'anno",
+        'Tra 0,8 e 1,1 m² per animale (suino leggero = Tra 0,6 e 0,7 m² per animale)']:
+        return 3
+    elif j in [
+        '6 o più suini per m²', 'Più di 12 volte l’anno',
+        "Più di 12 volte all'anno",
+        'Meno di 0,8 m² per animale (suino leggero = Meno di 0,6 m² per animale)']:
+        return 4
+    else:
+        return None
+
+def handle_special_cases(id, value):
+    try:
+        element = WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.CSS_SELECTOR, f"[id^='{id}']")))
+        if '<' in value or '>' in value:
+            element.send_keys(value)
+        else:
+            print(f"Unhandled special case: {value}")
+    except TimeoutException:
+        print(f"Failed to handle special case for input with id: {id}")
+    except Exception as e:
+        print(f"An error occurred while handling special cases: {e}")
+
+def handle_mixed_input(id, value):
+    try:
+        element = WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.CSS_SELECTOR, f"[id^='{id}']")))
+        element.send_keys(value)
+    except TimeoutException:
+        print(f"Failed to handle mixed input for id: {id}")
+    except Exception as e:
+        print(f"An error occurred while handling mixed input: {e}")
+
+for i in range(1 + offset, numberofrows):
+    input_data = data.values[i-1]
+    title = f'Automatic answer ({i}) {input_data[0]}'
+    input_data = input_data[1:]
+    starting_clicks(title)
+
+    answercount = 0
+    for j in input_data:
+        if answercount in [10, 26, 48, 55, 64, 70, 76, 80, 88, 94, 100, 112, 119]:
+            try:
+                driver.find_element(By.ID, 'edit-next').click()
+                print('newcat')
+            except Exception as e:
+                print(f"Error navigating to the next category: {e}")
+
+        if answercount == 120:
+            print('end')            
+            try:
+                driver.find_element(By.ID, 'edit-next').click()
+                click_save_button(driver)
+            except Exception as e:
+                print(f"Error clicking save or navigating: {e}")
+           
+        if isinstance(j, str):
+            if j in [
+                'No', 'Si', 'Sempre', 'Qualche volta', 'Mai', 'Sempre dalla stesso fornitore', 
+                'Da differenti fornitori', 'Sì/No castrazione/Una lama per nidiata', "Più di 12 volte all'anno",
+                '2 volte l’anno o meno', 'Si (allevatore, personale dipendente o ditta specializzata)',
+                'Tra le 3 e le 6 volte l’anno', 'Tra le 6 e le 12 volte l’anno', "Due o meno all'anno",
+                'Più di 12 volte l’anno', '3 o meno suini per m²', '4 suini per m²', "Tra 6 e 12 volte all'anno",
+                '5 suini per m²', '6 o più suini per m²', 'Sì, sempre più alto o uguale', 
+                'Non so', 'Più di una volta', "Due o meno all'anno", "Tra 3 e 6 volte all'anno", 
+                'Una volta', 'Zona di carico separata', 'Corridoio centrale o capannone', 
+                'Non', 'Bassa densità', 'Alta densità', "Tra 3 e 6 volte all'anno",
+                '1,5 o più m² per animale (suino leggero = 1 o più m² per animale)', 
+                'Tra 1,1 e 1,4 m² per animale (suino leggero = Tra 0,7 e 0,9 m² per animale)', 
+                'Tra 0,8 e 1,1 m² per animale (suino leggero = Tra 0,6 e 0,7 m² per animale)', 
+                'Meno di 0,8 m² per animale (suino leggero = Meno di 0,6 m² per animale)'
+            ]:
+                print('radio')
+                choice = determine_choice(j)
+                if choice is not None:
+                    id = f'edit-answer-{answercount}-answer-{choice}'
+                    answer_radio(id)
+                else:
+                    print(f"No valid choice found for answer: {j}")
+            elif any(char.isdigit() for char in j) and any(char.isalpha() for char in j):
+                print('mixed numeric and text')
+                id = f'edit-answer-{answercount}-answer'
+                handle_mixed_input(id, j)
+            else:
+                print('text')
+                id = f'edit-answer-{answercount}-answer'
+                answer_text(id, j)
+
+        elif isinstance(j, (int, float)):
+            print('numeric')
+            id = f'edit-answer-{answercount}-answer'
+            answer_num(id, j)
+
+        elif isinstance(j, str) and ('<' in j or '>' in j):  # Handle special cases
+            print('special case')
+            id = f'edit-answer-{answercount}-answer'
+            handle_special_cases(id, j)
+
+        time.sleep(1.2)
+        answercount += 1
