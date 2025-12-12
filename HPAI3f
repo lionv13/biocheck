@@ -1,0 +1,537 @@
+# -*- coding: utf-8 -*-
+"""
+Score farms (first 3 farms, NO country filter) using:
+1) OLD SCORE AS WEIGHT → BEST1 / B3ST2 / BEST3
+2) NEW SCORE AS WEIGHT → NEW-BEST / NEW_BES2 / NEW_BEST3
+
+Output workbook (mi_archivo_final.xlsx):
+- Sheet "Farms_EU":
+    farms + OLD scores + NEW scores + subcategory sums
+- Sheet "Scores_NEW":
+    only NEW scores (ScoreNEW__*) + Total_Score_NEW
+- Sheet "Scores_OLD":
+    only OLD scores (ScoreOLD__*) + Total_Score_OLD
+- Sheet "Scores_Vertical":
+    one row per Question with columns:
+      ID, Question,
+      Farm1_old, Farm1_new, ..., FarmN_old, FarmN_new,
+      Average_OLD, SD_OLD_±,
+      Average_NEW, SD_NEW_±
+- Sheet "Subcategories":
+    subcategory sums per farm:
+      FarmID, Country (if available),
+      <Code>_<Label>_OLD, <Code>_<Label>_NEW for A..K
+- Sheet "Subcategories_Stats":
+    one row per subcategory (A..K) with:
+      Code, Subcategory,
+      Average_OLD, SD_OLD_±,
+      Average_NEW, SD_NEW_±
+
+Author: you
+"""
+
+from __future__ import annotations
+import re
+from typing import Dict, Tuple
+import pandas as pd
+import numpy as np
+
+# -------------------- FILE PATHS -------------------- #
+EXCEL_FARMS   = r"/Users/gast/Documents/biocheck/trabajos/2025/mayo/eurodata/sbroilers.xlsx"
+EXCEL_WEIGHTS = r"/Users/gast/Documents/biocheck/trabajos/2025/noviembre/HPAI_IMPORTANCE broiler_experts3.xlsx"
+
+FARMS_SHEET   = 0
+WEIGHTS_SHEET = "score calculations"
+START_COL_INDEX = 5   # 0-based index (F = 5)
+
+# --------------------- EUROPEAN COUNTRIES --------------------- #
+EUROPEAN_COUNTRIES = {
+    "Austria","Belgium","Bulgaria","Croatia","Cyprus","Czech Republic","Czechia",
+    "Denmark","Estonia","Finland","France","Germany","Greece","Hungary","Ireland",
+    "Italy","Latvia","Lithuania","Luxembourg","Malta","Netherlands","Poland",
+    "Portugal","Romania","Slovakia","Slovenia","Spain","Sweden",
+    "United Kingdom","UK","Scotland","Wales","England","Northern Ireland",
+    "Norway","Switzerland","Iceland","Liechtenstein"
+}
+
+# --------------------- SUBCATEGORY RANGES --------------------- #
+# Question-number ranges per subcategory (from Q1, Q2, etc.)
+SUBCATEGORY_RANGES: Dict[str, Tuple[int, int]] = {
+    "A": (1, 4),    # Purchase of one-day-old chicks
+    "B": (5, 10),   # Depopulation of broilers (slaughterhouses, traders, individuals)
+    "C": (11, 18),  # Feed and water
+    "D": (19, 25),  # Removal of manure and carcasses
+    "E": (26, 34),  # Visitors and farmworkers
+    "F": (35, 36),  # Material supply
+    "G": (37, 47),  # Infrastructure and biological vectors
+    "H": (48, 51),  # Location of the farm
+    "I": (52, 56),  # Disease management
+    "J": (57, 75),  # Cleaning and disinfection
+    "K": (76, 79),  # Materials and measures between compartments
+}
+
+# Descriptive labels for each subcategory (your definitions)
+SUBCATEGORY_LABELS: Dict[str, str] = {
+    "I": "Disease management",
+    "H": "Location of the farm",
+    "G": "Infrastructure and biological vectors",
+    "F": "Material supply",
+    "E": "Visitors and farmworkers",
+    "C": "Feed and water",
+    "B": "Depopulation of broilers (slaughterhouses, traders, individuals)",
+    "A": "Purchase of one-day-old chicks",
+    "J": "Cleaning and disinfection",
+    "D": "Removal of manure and carcasses",
+    "K": "Materials and measures between compartments",
+}
+
+# Order you want them in the summary sheets
+ORDERED_SUBCATS = ["I", "H", "G", "F", "E", "C", "B", "A", "J", "D", "K"]
+
+
+# -------------------- HELPERS -------------------- #
+def _is_number(x) -> bool:
+    try:
+        return np.isfinite(float(x))
+    except Exception:
+        return False
+
+
+def _detect_question_start(df: pd.DataFrame, start_ix: int) -> int:
+    """
+    Heuristic: from column START_COL_INDEX onward, find the first column whose
+    name contains a digit; assume that is the first question column.
+    """
+    for j, c in enumerate(df.columns[start_ix:], start=start_ix):
+        name = str(c)
+        if any(ch.isdigit() for ch in name):
+            return j
+    return start_ix
+
+
+def _filter_european_farms(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    - Keep only rows where Country is in EUROPEAN_COUNTRIES.
+    - Exclude rows where Country == 'Fictional'.
+    - If 'Fictional' column exists, set it to 'No' for the remaining farms.
+
+    (Unused in this version – we keep all farms.)
+    """
+    if "Country" not in df.columns:
+        raise ValueError("Column 'Country' not found in farms file.")
+
+    df2 = df[df["Country"].isin(EUROPEAN_COUNTRIES)]
+    df2 = df2[df2["Country"].astype(str).str.lower() != "fictional"].copy()
+
+    if "Fictional" in df2.columns:
+        df2.loc[:, "Fictional"] = "No"
+
+    return df2
+
+
+def _question_to_subcategory(qname: str) -> str | None:
+    """
+    Given a question column name (e.g. "1. Something"),
+    return subcategory letter A..K based on its numeric prefix.
+    """
+    m = re.match(r"^\s*(\d+)", qname)
+    if not m:
+        return None
+    qnum = int(m.group(1))
+    for cat, (lo, hi) in SUBCATEGORY_RANGES.items():
+        if lo <= qnum <= hi:
+            return cat
+    return None
+
+
+# -------------------- READ BOTH OLD AND NEW WEIGHTS -------------------- #
+def _read_old_and_new_weights(xls_path: str) -> tuple[Dict[str, Dict[int, float]],
+                                                      Dict[str, Dict[int, float]]]:
+    """
+    From 'score calculations' sheet, build two mappings:
+
+        old_weights[question][answer] = score        # from OLD SCORE AS WEIGHT
+        new_weights[question][answer] = score        # from NEW SCORE AS WEIGHT
+
+    Where answer ∈ {1,2,3} and columns are:
+
+    OLD block:
+      row 0: 'OLD SCORE AS WEIGHT'
+      row 1: 'BEST1' | 'B3ST2' | 'BEST3'
+
+    NEW block:
+      row 0: 'NEW SCORE AS WEIGHT'
+      row 1: 'NEW-BEST' | 'NEW_BES2' | 'NEW_BEST3'
+    """
+    df = pd.read_excel(xls_path, sheet_name=WEIGHTS_SHEET)
+
+    # ---- find question column (contains "1.", "2.", etc) ----
+    question_col = None
+    for col in df.columns:
+        series = df[col].iloc[2:]  # skip header rows 0–1
+        if any(isinstance(v, str) and re.match(r"^\s*\d+\.", v) for v in series):
+            question_col = col
+            break
+    if question_col is None:
+        raise ValueError("Question column not found in weights file.")
+
+    # ---- find OLD SCORE AS WEIGHT block ----
+    old_idx = None
+    for i, col in enumerate(df.columns):
+        v0 = df.iloc[0, i]
+        v1 = df.iloc[1, i]
+        if isinstance(v0, str) and "OLD SCORE AS WEIGHT" in v0 and isinstance(v1, str) and "BEST1" in v1:
+            old_idx = i
+            break
+    if old_idx is None:
+        raise ValueError("OLD SCORE AS WEIGHT block not found.")
+
+    # ---- find NEW SCORE AS WEIGHT block ----
+    new_idx = None
+    for i, col in enumerate(df.columns):
+        v0 = df.iloc[0, i]
+        v1 = df.iloc[1, i]
+        if isinstance(v0, str) and "NEW SCORE AS WEIGHT" in v0 and isinstance(v1, str) and "NEW-BEST" in v1:
+            new_idx = i
+            break
+    if new_idx is None:
+        raise ValueError("NEW SCORE AS WEIGHT block not found.")
+
+    old_weights: Dict[str, Dict[int, float]] = {}
+    new_weights: Dict[str, Dict[int, float]] = {}
+
+    # data starts at row index 2
+    for i in range(2, df.shape[0]):
+        q = df.at[i, question_col]
+        if not isinstance(q, str):
+            continue
+        qkey = q.strip()
+        if not qkey:
+            continue
+
+        # OLD: BEST1 / B3ST2 / BEST3
+        vals_old = [
+            df.iat[i, old_idx],
+            df.iat[i, old_idx + 1],
+            df.iat[i, old_idx + 2],
+        ]
+        vals_old = [float(x) if _is_number(x) else 0.0 for x in vals_old]
+        old_weights[qkey] = {1: vals_old[0], 2: vals_old[1], 3: vals_old[2]}
+
+        # NEW: NEW-BEST / NEW_BES2 / NEW_BEST3
+        vals_new = [
+            df.iat[i, new_idx],
+            df.iat[i, new_idx + 1],
+            df.iat[i, new_idx + 2],
+        ]
+        vals_new = [float(x) if _is_number(x) else 0.0 for x in vals_new]
+        new_weights[qkey] = {1: vals_new[0], 2: vals_new[1], 3: vals_new[2]}
+
+    return old_weights, new_weights
+
+
+# -------------------- SCORING -------------------- #
+def _score(df: pd.DataFrame,
+           weights: Dict[str, Dict[int, float]],
+           first_q_col: int,
+           prefix: str) -> pd.DataFrame:
+    """
+    Build all score columns in one go to avoid fragmentation.
+
+    - df: farms DataFrame
+    - weights: mapping[question][answer] = score
+    - first_q_col: index of first question column
+    - prefix: "ScoreOLD__" or "ScoreNEW__"
+
+    Adds:
+      - Score columns: prefix + question_name
+      - Total_Score_OLD or Total_Score_NEW
+    """
+    base = df.copy()
+    qcols = list(base.columns[first_q_col:])
+
+    score_data = {}  # score_col_name -> list of scores
+
+    for qcol in qcols:
+        qkey = str(qcol).strip()
+        score_col = f"{prefix}{qkey}"
+
+        # if question not in weights, all zeros
+        if qkey not in weights:
+            score_data[score_col] = [0.0] * len(base)
+            continue
+
+        w = weights[qkey]  # {1: score, 2: score, 3: score}
+        row_scores = []
+        for v in base[qcol]:
+            if _is_number(v):
+                ans = int(round(float(v)))  # 1,2,3,...
+                sc = w.get(ans, 0.0)
+            else:
+                sc = 0.0
+            row_scores.append(sc)
+
+        score_data[score_col] = row_scores
+
+    # one concat to avoid fragmentation
+    scores_df = pd.DataFrame(score_data, index=base.index)
+    out = pd.concat([base, scores_df], axis=1)
+
+    total_col = "Total_Score_OLD" if prefix == "ScoreOLD__" else "Total_Score_NEW"
+    score_cols = list(scores_df.columns)
+    out[total_col] = out[score_cols].sum(axis=1)
+
+    return out
+
+
+# -------------------- MAIN -------------------- #
+def main():
+    # --- read farms ---
+    df = pd.read_excel(EXCEL_FARMS, sheet_name=FARMS_SHEET)
+
+    # --- NO country filter: keep all farms ---
+    df_eu = df.copy()
+
+    # --- keep first 3 farms only ---
+    df_eu = df_eu.head(3).copy()
+
+    # --- detect first question column ---
+    first_q_col = _detect_question_start(df_eu, START_COL_INDEX)
+
+    # --- read OLD + NEW weights ---
+    old_w, new_w = _read_old_and_new_weights(EXCEL_WEIGHTS)
+
+    # --- score OLD ---
+    scored_old = _score(df_eu, old_w, first_q_col, prefix="ScoreOLD__")
+
+    # --- score NEW on top of OLD ---
+    scored_all = _score(scored_old, new_w, first_q_col, prefix="ScoreNEW__")
+
+    # --- identify question columns (answer columns, not score columns) ---
+    qcols = [
+        c for c in scored_all.columns[first_q_col:]
+        if not str(c).startswith("ScoreOLD__")
+        and not str(c).startswith("ScoreNEW__")
+        and not str(c).startswith("Total_Score_")
+    ]
+
+    # --- build subcategory summed scores per farm ---
+    subcat_old_cols = {cat: [] for cat in SUBCATEGORY_RANGES}
+    subcat_new_cols = {cat: [] for cat in SUBCATEGORY_RANGES}
+
+    for qcol in qcols:
+        qname = str(qcol).strip()
+        subcat = _question_to_subcategory(qname)
+        if subcat is None:
+            continue
+        col_old = f"ScoreOLD__{qname}"
+        col_new = f"ScoreNEW__{qname}"
+        if col_old in scored_all.columns:
+            subcat_old_cols[subcat].append(col_old)
+        if col_new in scored_all.columns:
+            subcat_new_cols[subcat].append(col_new)
+
+    # add subcategory sum columns to scored_all
+    for cat in SUBCATEGORY_RANGES:
+        cols_o = subcat_old_cols.get(cat, [])
+        cols_n = subcat_new_cols.get(cat, [])
+        if cols_o:
+            scored_all[f"Sub{cat}_OLD"] = scored_all[cols_o].sum(axis=1)
+        else:
+            scored_all[f"Sub{cat}_OLD"] = np.nan
+        if cols_n:
+            scored_all[f"Sub{cat}_NEW"] = scored_all[cols_n].sum(axis=1)
+        else:
+            scored_all[f"Sub{cat}_NEW"] = np.nan
+
+    # --- write output Excel ---
+    out_path = "/Users/gast/Documents/biocheck/trabajos/2025/noviembre/no_EU.xlsx"
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        # Sheet 1: farms + OLD + NEW scores + subcategories
+        scored_all.to_excel(writer, sheet_name="Farms_EU", index=False)
+
+        # Sheet 2: only NEW scores + total
+        cols_new = [c for c in scored_all.columns if c.startswith("ScoreNEW__")] + ["Total_Score_NEW"]
+        scored_all[cols_new].to_excel(writer, sheet_name="Scores_NEW", index=False)
+
+        # Sheet 3: only OLD scores + total
+        cols_old = [c for c in scored_all.columns if c.startswith("ScoreOLD__")] + ["Total_Score_OLD"]
+        scored_all[cols_old].to_excel(writer, sheet_name="Scores_OLD", index=False)
+
+        # -----------------------------
+        # Sheet 4: per question, wide format:
+        # ID, Question, Farm1_old, Farm1_new, ..., FarmN_old, FarmN_new,
+        # Average_OLD, SD_OLD_±, Average_NEW, SD_NEW_±
+        # -----------------------------
+        id_col = scored_all.columns[0]  # farm identifier (first column)
+        n_farms = len(scored_all)
+        farm_indices = list(range(n_farms))
+
+        rows = []
+
+        for qcol in qcols:
+            qname = str(qcol).strip()
+            # ID from leading number (e.g. "1. Some question")
+            m = re.match(r"^\s*(\d+)", qname)
+            qid = m.group(1) if m else qname
+
+            row_dict = {
+                "ID": qid,
+                "Question": qname,
+            }
+
+            new_scores_for_question = []
+            old_scores_for_question = []
+
+            # For each farm, build FarmX_old and FarmX_new
+            for idx_farm, farm_idx in enumerate(farm_indices, start=1):
+                farm_row = scored_all.iloc[farm_idx]
+
+                col_old = f"ScoreOLD__{qname}"
+                col_new = f"ScoreNEW__{qname}"
+
+                score_old = farm_row[col_old] if col_old in scored_all.columns else np.nan
+                score_new = farm_row[col_new] if col_new in scored_all.columns else np.nan
+
+                row_dict[f"Farm{idx_farm}_old"] = score_old
+                row_dict[f"Farm{idx_farm}_new"] = score_new
+
+                if _is_number(score_old):
+                    old_scores_for_question.append(float(score_old))
+                if _is_number(score_new):
+                    new_scores_for_question.append(float(score_new))
+
+            # --- averages & SDs for OLD ---
+            if old_scores_for_question:
+                avg_old = float(np.mean(old_scores_for_question))
+                if len(old_scores_for_question) > 1:
+                    sd_old = float(np.std(old_scores_for_question, ddof=1))
+                else:
+                    sd_old = 0.0
+            else:
+                avg_old = np.nan
+                sd_old = np.nan
+
+            row_dict["Average_OLD"] = avg_old
+            if _is_number(sd_old):
+                row_dict["SD_OLD_±"] = f"±{sd_old:.3f}"
+            else:
+                row_dict["SD_OLD_±"] = ""
+
+            # --- averages & SDs for NEW ---
+            if new_scores_for_question:
+                avg_new = float(np.mean(new_scores_for_question))
+                if len(new_scores_for_question) > 1:
+                    sd_new = float(np.std(new_scores_for_question, ddof=1))
+                else:
+                    sd_new = 0.0
+            else:
+                avg_new = np.nan
+                sd_new = np.nan
+
+            row_dict["Average_NEW"] = avg_new
+            if _is_number(sd_new):
+                row_dict["SD_NEW_±"] = f"±{sd_new:.3f}"
+            else:
+                row_dict["SD_NEW_±"] = ""
+
+            rows.append(row_dict)
+
+        df_questions = pd.DataFrame(rows)
+
+        # Sort by numeric ID if possible
+        def _safe_int(x):
+            try:
+                return int(x)
+            except Exception:
+                return 1_000_000_000  # non-numeric at end
+
+        df_questions["__sort_id"] = df_questions["ID"].apply(_safe_int)
+        df_questions.sort_values("__sort_id", inplace=True)
+        df_questions.drop(columns="__sort_id", inplace=True)
+
+        df_questions.to_excel(writer, sheet_name="Scores_Vertical", index=False)
+
+        # -----------------------------
+        # Sheet 5: Subcategory sums per farm (with descriptive names)
+        # -----------------------------
+        base_cols = [scored_all.columns[0]]
+        if "Country" in scored_all.columns:
+            base_cols.append("Country")
+
+        # collect internal column names in ORDERED_SUBCATS
+        sub_cols_internal = []
+        for cat in ORDERED_SUBCATS:
+            sub_cols_internal.append(f"Sub{cat}_OLD")
+            sub_cols_internal.append(f"Sub{cat}_NEW")
+
+        df_sub = scored_all[base_cols + sub_cols_internal].copy()
+
+        # rename with letter and label, e.g. "SubA_OLD" -> "A_Purchase of one-day-old chicks_OLD"
+        rename_map = {}
+        for cat in ORDERED_SUBCATS:
+            label = SUBCATEGORY_LABELS.get(cat, "").strip()
+            col_old = f"Sub{cat}_OLD"
+            col_new = f"Sub{cat}_NEW"
+            if label:
+                rename_map[col_old] = f"{cat}_{label}_OLD"
+                rename_map[col_new] = f"{cat}_{label}_NEW"
+        df_sub.rename(columns=rename_map, inplace=True)
+
+        df_sub.to_excel(writer, sheet_name="Subcategories", index=False)
+
+        # -----------------------------
+        # Sheet 6: Subcategory stats across farms
+        # -----------------------------
+        stats_rows = []
+        for cat in ORDERED_SUBCATS:
+            label = SUBCATEGORY_LABELS.get(cat, "").strip()
+            col_old = f"Sub{cat}_OLD"
+            col_new = f"Sub{cat}_NEW"
+
+            if col_old in scored_all.columns:
+                vals_old = scored_all[col_old].values
+                vals_old = [float(v) for v in vals_old if _is_number(v)]
+            else:
+                vals_old = []
+            if col_new in scored_all.columns:
+                vals_new = scored_all[col_new].values
+                vals_new = [float(v) for v in vals_new if _is_number(v)]
+            else:
+                vals_new = []
+
+            # OLD stats
+            if vals_old:
+                avg_old = float(np.mean(vals_old))
+                sd_old = float(np.std(vals_old, ddof=1)) if len(vals_old) > 1 else 0.0
+            else:
+                avg_old = np.nan
+                sd_old = np.nan
+
+            # NEW stats
+            if vals_new:
+                avg_new = float(np.mean(vals_new))
+                sd_new = float(np.std(vals_new, ddof=1)) if len(vals_new) > 1 else 0.0
+            else:
+                avg_new = np.nan
+                sd_new = np.nan
+
+            row = {
+                "Code": cat,
+                "Subcategory": label if label else cat,
+                "Average_OLD": avg_old,
+                "SD_OLD_±": f"±{sd_old:.3f}" if _is_number(sd_old) else "",
+                "Average_NEW": avg_new,
+                "SD_NEW_±": f"±{sd_new:.3f}" if _is_number(sd_new) else "",
+            }
+            stats_rows.append(row)
+
+        df_stats = pd.DataFrame(stats_rows)
+        df_stats.to_excel(writer, sheet_name="Subcategories_Stats", index=False)
+
+    print(f"[OK] Saved: {out_path}")
+    print(f"[Info] Farms selected: {len(df_eu)} (no country filter, first 3 farms)")
+
+
+if __name__ == "__main__":
+    main()
